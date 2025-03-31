@@ -10,8 +10,32 @@ android {
         versionCode 1
         versionName "1.0"
     }
+
+    // Define build types to match your app's expectations (debug and release)
+    buildTypes {
+        debug {}
+        release {
+            minifyEnabled false
+        }
+    }
+
+    // Ensure the library produces consumable variants
+    libraryVariants.all { variant ->
+        def name = variant.name.capitalize()
+        task("prepare${name}Dependencies") {
+            // Optional: Add any pre-build steps if needed
+        }
+    }
 }
 
 dependencies {
-    implementation 'com.facebook.react:react-native:+'
+    // Use the same React Native version as your app for consistency
+    implementation 'com.facebook.react:react-native:0.76.6' // Match your app's react-native version
 }
+
+// Optional: Add this if you plan to publish this library later
+// publishing {
+//     singleVariant('release') {
+//         withSourcesJar()
+//     }
+// }
