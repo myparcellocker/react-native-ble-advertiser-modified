@@ -1,31 +1,35 @@
 #import "BLEAdvertiser.h"
 @import CoreBluetooth;
 
+// Declare private methods in a class extension
 @interface BLEAdvertiser ()
-- (void)startAdvertising;
+- (void)startAdvertisingInternal; // Renamed internal helper
+- (void)stopAdvertisingInternalAndReject:(NSString *)code message:(NSString *)message error:(NSError *)error; // Helper to stop and cleanup promises
+- (void)cleanupPendingBroadcast:(BOOL)shouldReject code:(NSString *)code message:(NSString *)message error:(NSError *)error; // Helper to clear promise vars
 @end
-
+// End of class extension
 
 @implementation BLEAdvertiser {
-    CBCentralManager *centralManager;
-    CBPeripheralManager *peripheralManager;
-    int companyId; // Instance variable to store companyId
-    // Store broadcast parameters
-    NSString *pendingUid;
-    NSArray *pendingPayload;
-    NSDictionary *pendingOptions;
-    RCTPromiseResolveBlock pendingResolve;
-    RCTPromiseRejectBlock pendingReject;
+    CBCentralManager *centralManager; // For scanning state/permissions
+    CBPeripheralManager *peripheralManager; // For advertising
+
+    int companyId;
+
+    // State for Advertising
+    BOOL isTryingToAdvertise; // Flag: Are we currently *supposed* to be advertising?
+    NSDictionary *currentAdvertisingData; // Data we are trying to advertise
+    RCTPromiseResolveBlock pendingAdResolve; // Promise for the current/pending startAdvertising call
+    RCTPromiseRejectBlock pendingAdReject;   // Promise for the current/pending startAdvertising call
 }
 
 - (dispatch_queue_t)methodQueue
 {
+    // Ensure CoreBluetooth calls happen on the main thread
     return dispatch_get_main_queue();
 }
 
 RCT_EXPORT_MODULE(BLEAdvertiser)
 
-// Updated to include "onNativeLog" in supported events
 - (NSArray<NSString *> *)supportedEvents {
     return @[@"onDeviceFound", @"onBTStatusChange", @"onNativeLog"];
 }
@@ -36,250 +40,348 @@ RCT_EXPORT_MODULE(BLEAdvertiser)
     va_start(args, format);
     NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-    RCTLogInfo(@"Native Log: %@", message); // Use RCTLogInfo for React Native debugging
+    RCTLogInfo(@"Native Log: %@", message);
     [self sendEventWithName:@"onNativeLog" body:@{@"message": message}];
 }
 
-RCT_EXPORT_METHOD(setCompanyId: (nonnull NSNumber *)companyIdNum){
-    [self logAndSend:@"setCompanyId function called %@", companyIdNum];
-    companyId = [companyIdNum intValue]; // Store the company ID (e.g., 0xFFFF)
-
-    // Initialize managers if they don't exist yet
-    if (!centralManager) {
-        self->centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:nil options:@{CBCentralManagerOptionShowPowerAlertKey: @(YES)}];
+// Ensure managers are initialized when the module loads (or lazily)
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        // Initialize flags
+        isTryingToAdvertise = NO;
+        // Initialize managers lazily or here - doing it here for simplicity
+         if (!centralManager) {
+            centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:dispatch_get_main_queue() options:@{CBCentralManagerOptionShowPowerAlertKey: @(NO)}]; // Use main queue, hide default power alert
+         }
+         if (!peripheralManager) {
+            peripheralManager = [[CBPeripheralManager alloc] initWithDelegate:self queue:dispatch_get_main_queue() options:nil]; // Use main queue
+         }
     }
-    if (!peripheralManager) {
-        self->peripheralManager = [[CBPeripheralManager alloc] initWithDelegate:self queue:nil options:nil];
-    }
+    return self;
 }
 
-RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray options:(NSDictionary *)options
-    resolve: (RCTPromiseResolveBlock)resolve
-    rejecter:(RCTPromiseRejectBlock)reject){
-    [self logAndSend:@"Broadcast function called %@ with payload %@", uid, payloadArray];
+// Invalidate managers on dealloc
+- (void)invalidate {
+     [self logAndSend:@"Module invalidating."];
+     if (peripheralManager && peripheralManager.isAdvertising) {
+         [peripheralManager stopAdvertising];
+     }
+     // Setting delegates to nil is important to prevent crashes if callbacks occur after dealloc
+     if (centralManager) {
+         centralManager.delegate = nil;
+         centralManager = nil;
+     }
+      if (peripheralManager) {
+         peripheralManager.delegate = nil;
+         peripheralManager = nil;
+     }
+     [self cleanupPendingBroadcast:YES code:@"ModuleInvalidated" message:@"Module resources released." error:nil];
+}
 
+
+RCT_EXPORT_METHOD(setCompanyId: (nonnull NSNumber *)companyIdNum){
+    [self logAndSend:@"setCompanyId function called %@", companyIdNum];
+    companyId = [companyIdNum intValue];
+    // Managers are initialized in init now
+}
+
+RCT_EXPORT_METHOD(broadcast: (NSString *)uid // uid is not used for manufacturer data, but kept for API consistency
+                  payload:(NSArray *)payloadArray
+                  options:(NSDictionary *)options // options are currently ignored on iOS
+                  resolve: (RCTPromiseResolveBlock)resolve
+                 rejecter:(RCTPromiseRejectBlock)reject){
+    [self logAndSend:@"broadcast called with payload: %@", payloadArray];
+
+    // Reject if managers aren't initialized (shouldn't happen with init method)
     if (!peripheralManager) {
-        [self logAndSend:@"Peripheral manager not initialized before broadcast call."];
+        [self logAndSend:@"ERROR: Peripheral manager nil in broadcast"];
         reject(@"PeripheralManagerError", @"Peripheral manager not initialized", nil);
         return;
     }
 
-    // Check if already broadcasting or pending
-    if (pendingUid || pendingResolve) {
-         [self logAndSend:@"Broadcast already in progress or pending."];
-         reject(@"BroadcastInProgress", @"Another broadcast operation is already pending.", nil);
-         return;
-    }
-
-    // Store parameters
-    pendingUid = [uid copy];
-    pendingPayload = [payloadArray copy];
-    pendingOptions = [options copy];
-    pendingResolve = [resolve copy];
-    pendingReject = [reject copy];
-
-    // Check state and start immediately if ready
-    if (peripheralManager.state == CBManagerStatePoweredOn) {
-        [self startAdvertising]; // Call the correctly defined method
-    } else {
-        [self logAndSend:@"Waiting for peripheral manager to be powered on... Current state: %ld", (long)peripheralManager.state];
-        // The peripheralManagerDidUpdateState callback will call startAdvertising if it powers on
-    }
-}
-
-// CORRECTED Method Definition (starts with '-')
-- (void)startAdvertising {
-    if (!pendingUid || !pendingPayload || !pendingResolve || !pendingReject) {
-        [self logAndSend:@"Attempted to start advertising, but no pending parameters found."];
-        // If this happens unexpectedly, it might indicate a logic error elsewhere.
+    // Reject if already trying to advertise or have a pending promise
+    if (isTryingToAdvertise || pendingAdResolve || pendingAdReject) {
+        [self logAndSend:@"Warning: Broadcast called while another operation is pending or active."];
+        reject(@"BroadcastPending", @"Another broadcast operation is already active or pending.", nil);
         return;
     }
 
-    // Convert payload array to NSData
+    // --- Prepare Data ---
     NSMutableData *payloadData = [NSMutableData data];
-    for (NSNumber *byteNum in pendingPayload) {
+    for (NSNumber *byteNum in payloadArray) {
         uint8_t byte = [byteNum unsignedCharValue];
         [payloadData appendBytes:&byte length:1];
     }
-
-    // Create manufacturer data: companyId (2 bytes, little-endian) + payload
-    uint16_t companyIdLE = OSSwapHostToLittleInt16(companyId); // Ensure little-endian for Bluetooth spec
+    uint16_t companyIdLE = OSSwapHostToLittleInt16(companyId);
     NSMutableData *manufacturerData = [NSMutableData dataWithBytes:&companyIdLE length:2];
     [manufacturerData appendData:payloadData];
 
-    // --- Advertise ONLY Manufacturer Data to force it into the main packet ---
-    NSDictionary *advertisingData = @{
+    // Store the data we *intend* to advertise
+    currentAdvertisingData = @{
         CBAdvertisementDataManufacturerDataKey : manufacturerData
-        // CBAdvertisementDataServiceUUIDsKey : @[[CBUUID UUIDWithString:pendingUid]] // <-- Keep commented
+        // Optional: Add local name later if needed and space allows
+        // CBAdvertisementDataLocalNameKey : @"MyDeviceName"
     };
-    // ---
+    // --- End Prepare Data ---
 
-    [self logAndSend:@"Attempting to start advertising with Manufacturer Data ONLY: %@", manufacturerData];
-    [peripheralManager startAdvertising:advertisingData];
+    // Store the promise callbacks
+    pendingAdResolve = [resolve copy];
+    pendingAdReject = [reject copy];
+    isTryingToAdvertise = YES; // Set the flag *before* checking state
 
-    // Store copies of the resolve/reject blocks to use inside the dispatch_after block
-    RCTPromiseResolveBlock resolveBlock = [pendingResolve copy];
-    RCTPromiseRejectBlock rejectBlock = [pendingReject copy];
+    [self logAndSend:@"Data prepared, checking peripheral state..."];
 
-    // Clear the original pending promises immediately after starting the advertising attempt
-    pendingUid = nil;
-    pendingPayload = nil;
-    pendingOptions = nil;
-    pendingResolve = nil;
-    pendingReject = nil;
-
-
-    // Check if advertising actually started after a short delay (0.5 seconds)
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // Use the captured resolve/reject blocks
-        if (self->peripheralManager.isAdvertising) {
-            [self logAndSend:@"Peripheral manager IS advertising."];
-            if (resolveBlock) {
-                 resolveBlock(@"Broadcasting (Manufacturer Data Only)"); // Fulfill the promise
-            }
-        } else {
-            [self logAndSend:@"Peripheral manager IS NOT advertising (checked after 0.5s)."];
-             if (rejectBlock) {
-                 rejectBlock(@"AdvertisingStartFailed", @"Peripheral manager did not confirm advertising state after command.", nil); // Reject the promise
-             }
-        }
-    });
-
-} // <-- Closes the startAdvertising method
-
-
-RCT_EXPORT_METHOD(stopBroadcast:(RCTPromiseResolveBlock)resolve
-    rejecter:(RCTPromiseRejectBlock)reject){
-    [self logAndSend:@"stopBroadcast function called"];
-    if (peripheralManager) {
-        if (peripheralManager.isAdvertising) {
-             [peripheralManager stopAdvertising];
-             [self logAndSend:@"Stopped advertising."];
-        } else {
-             [self logAndSend:@"Was not advertising, but called stop anyway."];
-        }
-        // Also clear any pending start operation that might not have completed
-        if(pendingResolve || pendingReject) {
-            [self logAndSend:@"Cleared pending broadcast promises during stop."];
-            if (pendingReject) { // Reject any pending promise if we are stopping.
-                 pendingReject(@"BroadcastStopped", @"Broadcast was stopped before completion.", nil);
-            }
-             pendingUid = nil; pendingPayload = nil; pendingOptions = nil; pendingResolve = nil; pendingReject = nil;
-        }
-        resolve(@"Stopping Broadcast Initiated"); // Resolve immediately
+    // Check state and attempt to start *immediately* if ready
+    if (peripheralManager.state == CBManagerStatePoweredOn) {
+        [self logAndSend:@"Peripheral is Powered ON. Attempting to start advertising..."];
+        [self startAdvertisingInternal];
     } else {
-        [self logAndSend:@"Peripheral manager not initialized during stopBroadcast call."];
-        reject(@"PeripheralManagerError", @"Peripheral manager not initialized", nil);
+        [self logAndSend:@"Peripheral is NOT Powered ON (State: %ld). Waiting for state update.", (long)peripheralManager.state];
+        // Advertising will be started by peripheralManagerDidUpdateState when it powers on
+        // The promise remains pending.
     }
 }
+
+// Internal helper to actually call startAdvertising
+- (void)startAdvertisingInternal {
+    if (!isTryingToAdvertise || !currentAdvertisingData) {
+        [self logAndSend:@"startAdvertisingInternal called but not trying to advertise or no data. Ignoring."];
+        return;
+    }
+
+    // Check state again just in case
+    if (peripheralManager.state != CBManagerStatePoweredOn) {
+        [self logAndSend:@"startAdvertisingInternal: State is not Powered ON (%ld). Aborting.", (long)peripheralManager.state];
+        // We might need to reject the promise here if the state changed between the initial check and now
+        [self cleanupPendingBroadcast:YES code:@"BluetoothNotReady" message:@"Bluetooth powered off before advertising could start." error:nil];
+        isTryingToAdvertise = NO;
+        currentAdvertisingData = nil;
+        return;
+    }
+
+    [self logAndSend:@"Calling [peripheralManager startAdvertising:%@]", currentAdvertisingData];
+    // THE ACTUAL CALL TO START ADVERTISING
+    [peripheralManager startAdvertising:currentAdvertisingData];
+    // --- IMPORTANT: DO NOT resolve the promise here. Wait for the delegate callback. ---
+}
+
+RCT_EXPORT_METHOD(stopBroadcast:(RCTPromiseResolveBlock)resolve
+                 rejecter:(RCTPromiseRejectBlock)reject){
+    [self logAndSend:@"stopBroadcast called."];
+    // We don't need rejecter here, stop is usually fire-and-forget success
+    [self stopAdvertisingInternalAndReject:nil message:nil error:nil]; // Stop advertising, don't reject any pending *start* promise
+    resolve(@"Stop broadcast requested."); // Resolve immediately that the stop *request* was processed
+}
+
+// Internal helper to stop advertising and potentially reject a pending START promise
+- (void)stopAdvertisingInternalAndReject:(NSString *)code message:(NSString *)message error:(NSError *)error {
+    BOOL wasTryingToAdvertise = isTryingToAdvertise;
+    isTryingToAdvertise = NO; // Clear the intention flag *first*
+    currentAdvertisingData = nil;
+
+    if (peripheralManager && peripheralManager.isAdvertising) {
+        [self logAndSend:@"Stopping active advertising."];
+        [peripheralManager stopAdvertising];
+    } else {
+         [self logAndSend:@"Stop requested, but peripheral manager was not advertising."];
+    }
+
+    // If we were trying to start, and are now stopping, reject the pending promise if rejection details provided
+    if (wasTryingToAdvertise && code) {
+        [self cleanupPendingBroadcast:YES code:code message:message error:error];
+    } else {
+        // Otherwise, just clear any leftover promise vars without rejecting
+        [self cleanupPendingBroadcast:NO code:nil message:nil error:nil];
+    }
+}
+
+// Helper to clear out promise variables, optionally rejecting
+- (void)cleanupPendingBroadcast:(BOOL)shouldReject code:(NSString *)code message:(NSString *)message error:(NSError *)error {
+    if (shouldReject && pendingAdReject) {
+        [self logAndSend:@"Rejecting pending broadcast promise. Code: %@, Message: %@", code, message];
+        pendingAdReject(code, message, error);
+    } else if (pendingAdResolve) {
+        // This case should ideally not happen if cleanup is called correctly,
+        // but ensures resolve isn't left hanging if reject wasn't called.
+         [self logAndSend:@"Warning: Cleaning up pending resolve block without explicit resolution."];
+    }
+    pendingAdResolve = nil;
+    pendingAdReject = nil;
+}
+
+
+#pragma mark - CBPeripheralManagerDelegate Methods
+
+- (void)peripheralManagerDidUpdateState:(CBPeripheralManager *)peripheral {
+    [self logAndSend:@"Peripheral Manager State Updated: %ld", (long)peripheral.state];
+
+    switch (peripheral.state) {
+        case CBManagerStatePoweredOn:
+            [self logAndSend:@"State: Powered ON."];
+            // If we *intend* to be advertising, try starting now
+            if (isTryingToAdvertise) {
+                [self logAndSend:@"Powered ON and should be advertising, attempting start..."];
+                [self startAdvertisingInternal];
+            }
+            break;
+
+        // Handle all non-powered-on states
+        case CBManagerStatePoweredOff:
+        case CBManagerStateResetting:
+        case CBManagerStateUnauthorized:
+        case CBManagerStateUnsupported:
+        case CBManagerStateUnknown:
+            [self logAndSend:@"State: Not Powered ON (%ld).", (long)peripheral.state];
+            // If we were trying to advertise, it has implicitly stopped or failed to start.
+            // Reject any pending START promise.
+            if (isTryingToAdvertise) {
+                NSString *reason;
+                NSString *code;
+                 switch (peripheral.state) {
+                    case CBManagerStatePoweredOff: reason = @"Bluetooth is powered off"; code = @"BluetoothPoweredOff"; break;
+                    case CBManagerStateResetting: reason = @"Bluetooth is resetting"; code = @"BluetoothResetting"; break;
+                    case CBManagerStateUnauthorized: reason = @"Bluetooth permission denied"; code = @"BluetoothUnauthorized"; break;
+                    case CBManagerStateUnsupported: reason = @"Bluetooth LE not supported"; code = @"BluetoothUnsupported"; break;
+                    default: reason = @"Bluetooth state unknown or unavailable"; code = @"BluetoothUnknown"; break;
+                }
+                 [self logAndSend:@"Rejecting pending broadcast due to peripheral state change: %@", reason];
+                 // Call cleanup helper to reject and clear vars
+                 [self cleanupPendingBroadcast:YES code:code message:reason error:nil];
+                 isTryingToAdvertise = NO; // Clear intention as it failed
+                 currentAdvertisingData = nil;
+            }
+             // Ensure advertising is physically stopped if manager reports it's still on (unlikely but safe)
+            if (peripheral.isAdvertising) {
+                 [self logAndSend:@"Stopping advertising due to non-ON state."];
+                 [peripheral stopAdvertising];
+            }
+            break;
+
+        default:
+             [self logAndSend:@"State: Unknown default case."];
+            break;
+    }
+    // Forward state change to JS for BT status updates (independent of advertising)
+     BOOL enabled = (peripheral.state == CBManagerStatePoweredOn);
+     [self sendEventWithName:@"onBTStatusChange" body:@{@"enabled": @(enabled)}];
+}
+
+// THIS IS THE KEY CALLBACK FOR CONFIRMATION
+- (void)peripheralManagerDidStartAdvertising:(CBPeripheralManager *)peripheral error:(NSError *)error {
+    // This is called AFTER [peripheralManager startAdvertising:] is invoked.
+
+    if (error) {
+        [self logAndSend:@"--> FAILED to start advertising: %@", error.localizedDescription];
+        // If we failed, reject the pending promise and clear the intention flag
+        [self cleanupPendingBroadcast:YES code:@"AdvertisingStartFailed" message:error.localizedDescription error:error];
+        isTryingToAdvertise = NO;
+        currentAdvertisingData = nil;
+
+    } else {
+        [self logAndSend:@"--> SUCCESS: Advertising started successfully (confirmed by delegate)."];
+        // If we succeeded, resolve the pending promise
+        if (pendingAdResolve) {
+            pendingAdResolve(@"Advertising started successfully.");
+        } else {
+            // This shouldn't happen if state is managed correctly
+            [self logAndSend:@"Warning: Advertising started but no pending resolve block found."];
+        }
+        // Clear promises now that we've resolved
+        [self cleanupPendingBroadcast:NO code:nil message:nil error:nil];
+        // Keep isTryingToAdvertise = YES because we are now successfully advertising
+    }
+}
+
+
+#pragma mark - CBCentralManagerDelegate Methods (Mostly for BT status/permissions)
+
+- (void)centralManagerDidUpdateState:(CBCentralManager *)central {
+     // We use peripheralManagerDidUpdateState for advertising logic trigger,
+     // but central manager state is useful for overall BT status reporting.
+     [self logAndSend:@"Central Manager State Updated: %ld", (long)central.state];
+     // We can optionally send a separate onBTStatusChange event based on central state
+     // but peripheral state is more directly relevant to advertising capability.
+     // Let's keep the onBTStatusChange tied to peripheral state for consistency.
+}
+
+// Optional: Add stubs for other CBCentralManagerDelegate methods if needed for scanning later
+// - (void)centralManager:(CBCentralManager *)central didDiscoverPeripheral:(CBPeripheral *)peripheral ... {}
+
+
+// --- Methods related to Scanning (Keep your existing implementations) ---
 
 RCT_EXPORT_METHOD(scan: (NSArray *)payload options:(NSDictionary *)options
     resolve: (RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logAndSend:@"scan function called (Note: payload argument currently ignored on iOS scan)"];
-
-    if (!centralManager) {
-        [self logAndSend:@"Central manager not initialized before scan call."];
-        reject(@"Device does not support Bluetooth", @"Adapter is Null", nil);
-        return;
-    }
-
-    if (centralManager.state != CBManagerStatePoweredOn) {
-         [self logAndSend:@"Scan attempted but Bluetooth is not powered on. State: %ld", (long)centralManager.state];
-         NSString *stateStr;
-         switch(centralManager.state) {
-             case CBManagerStatePoweredOff:   stateStr = @"Powered off"; break;
-             case CBManagerStateResetting:    stateStr = @"Resetting"; break;
-             case CBManagerStateUnauthorized: stateStr = @"Unauthorized"; break;
-             case CBManagerStateUnknown:      stateStr = @"Unknown"; break;
-             case CBManagerStateUnsupported:  stateStr = @"Unsupported"; break;
-             default: stateStr = @"Error"; break;
-         }
-         reject(@"BluetoothNotReady", [NSString stringWithFormat:@"Bluetooth not ON: %@", stateStr], nil);
-         return;
-    }
-
-    [self logAndSend:@"Starting scan for all peripherals..."];
-    [centralManager scanForPeripheralsWithServices:nil options:@{CBCentralManagerScanOptionAllowDuplicatesKey:[NSNumber numberWithBool:YES]}];
-    resolve(@"Scanning Started");
+    // Keep existing scan logic...
+    [self logAndSend:@"scan function called"];
+     if (!centralManager) { [self logAndSend:@"Central manager nil in scan"]; reject(@"CentralManagerError", @"Central manager not initialized", nil); return; }
+     if (centralManager.state != CBManagerStatePoweredOn) { reject(@"BluetoothNotReady", @"Bluetooth not powered on for scanning", nil); return; }
+     [centralManager scanForPeripheralsWithServices:nil options:@{CBCentralManagerScanOptionAllowDuplicatesKey:@(YES)}];
+     resolve(@"Scanning Started");
 }
 
 RCT_EXPORT_METHOD(scanByService: (NSString *)uid options:(NSDictionary *)options
     resolve: (RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
+    // Keep existing scanByService logic...
     [self logAndSend:@"scanByService function called with UID %@", uid];
-
-    if (!centralManager) {
-        [self logAndSend:@"Central manager not initialized before scanByService call."];
-        reject(@"Device does not support Bluetooth", @"Adapter is Null", nil);
-        return;
-    }
-
-     if (centralManager.state != CBManagerStatePoweredOn) {
-         [self logAndSend:@"scanByService attempted but Bluetooth is not powered on. State: %ld", (long)centralManager.state];
-         NSString *stateStr;
-         switch(centralManager.state) {
-             case CBManagerStatePoweredOff:   stateStr = @"Powered off"; break;
-             case CBManagerStateResetting:    stateStr = @"Resetting"; break;
-             case CBManagerStateUnauthorized: stateStr = @"Unauthorized"; break;
-             case CBManagerStateUnknown:      stateStr = @"Unknown"; break;
-             case CBManagerStateUnsupported:  stateStr = @"Unsupported"; break;
-             default: stateStr = @"Error"; break;
-         }
-         reject(@"BluetoothNotReady", [NSString stringWithFormat:@"Bluetooth not ON: %@", stateStr], nil);
-         return;
-    }
-
-    CBUUID *serviceUUID = [CBUUID UUIDWithString:uid];
-    if (!serviceUUID) {
-        [self logAndSend:@"Invalid Service UUID format: %@", uid];
-        reject(@"InvalidUUID", @"Invalid Service UUID format", nil);
-        return;
-    }
-
-    [self logAndSend:@"Starting scan for service UUID: %@", uid];
-    [centralManager scanForPeripheralsWithServices:@[serviceUUID] options:@{CBCentralManagerScanOptionAllowDuplicatesKey:[NSNumber numberWithBool:YES]}];
-    resolve(@"Scanning by service Started");
+     if (!centralManager) { [self logAndSend:@"Central manager nil in scanByService"]; reject(@"CentralManagerError", @"Central manager not initialized", nil); return; }
+     if (centralManager.state != CBManagerStatePoweredOn) { reject(@"BluetoothNotReady", @"Bluetooth not powered on for scanning", nil); return; }
+     CBUUID *serviceUUID = [CBUUID UUIDWithString:uid];
+     if (!serviceUUID) { reject(@"InvalidUUID", @"Invalid Service UUID format", nil); return; }
+     [centralManager scanForPeripheralsWithServices:@[serviceUUID] options:@{CBCentralManagerScanOptionAllowDuplicatesKey:@(YES)}];
+     resolve(@"Scanning by service Started");
 }
 
 RCT_EXPORT_METHOD(stopScan:(RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logAndSend:@"stopScan function called"];
-    if (centralManager) {
-        if (centralManager.isScanning) {
-             [centralManager stopScan];
-             [self logAndSend:@"Stopped scanning."];
-        } else {
-             [self logAndSend:@"Was not scanning, but called stopScan anyway."];
-        }
-        resolve(@"Stopping Scan Initiated");
-    } else {
-        [self logAndSend:@"Central manager not initialized during stopScan call."];
-        reject(@"CentralManagerError", @"Central manager not initialized", nil);
+    // Keep existing stopScan logic...
+     [self logAndSend:@"stopScan function called"];
+     if (!centralManager) { reject(@"CentralManagerError", @"Central manager not initialized", nil); return; }
+     if (centralManager.isScanning) { [centralManager stopScan]; [self logAndSend:@"Stopped scanning."]; }
+     resolve(@"Stopping Scan Initiated");
+}
+
+-(void)centralManager:(CBCentralManager *)central didDiscoverPeripheral:(CBPeripheral *)peripheral advertisementData:(NSDictionary<NSString *,id> *)advertisementData RSSI:(NSNumber *)RSSI {
+     // Keep existing didDiscoverPeripheral logic...
+     [self logAndSend:@"Discovered Peripheral: Name: %@, ID: %@, RSSI: %@", [peripheral name], [[peripheral identifier] UUIDString], RSSI];
+     // ... (rest of your parsing and sendEvent logic)
+    NSMutableDictionary *params =  [[NSMutableDictionary alloc] init];
+    NSMutableArray *serviceUUIDs = [[NSMutableArray alloc] init];
+    NSArray *uuidArray = advertisementData[CBAdvertisementDataServiceUUIDsKey];
+    if ([uuidArray isKindOfClass:[NSArray class]]) {
+        for (CBUUID *uuid in uuidArray) { [serviceUUIDs addObject:[uuid UUIDString]]; }
     }
+    NSData *manufData = advertisementData[CBAdvertisementDataManufacturerDataKey];
+    if ([manufData isKindOfClass:[NSData class]] && manufData.length >= 2) {
+        uint16_t discoveredCompanyId = 0; [manufData getBytes:&discoveredCompanyId length:2]; discoveredCompanyId = OSSwapLittleToHostInt16(discoveredCompanyId);
+        params[@"companyId"] = @(discoveredCompanyId);
+        if (manufData.length > 2) {
+             NSData *payloadBytes = [manufData subdataWithRange:NSMakeRange(2, manufData.length - 2)]; NSMutableArray *payloadArray = [[NSMutableArray alloc] init]; const uint8_t *bytes = [payloadBytes bytes]; for (NSUInteger i = 0; i < [payloadBytes length]; i++) { [payloadArray addObject:@(bytes[i])]; } params[@"manufData"] = payloadArray;
+        } else { params[@"manufData"] = @[]; }
+    } else { params[@"manufData"] = @[]; }
+    NSNumber *validRSSI = (RSSI && RSSI.intValue != 127) ? RSSI : nil;
+    params[@"serviceUuids"] = serviceUUIDs; params[@"rssi"] = validRSSI ?: [NSNull null]; params[@"deviceName"] = [peripheral name] ?: [NSNull null]; params[@"deviceAddress"] = [[peripheral identifier] UUIDString]; NSNumber *txPower = advertisementData[CBAdvertisementDataTxPowerLevelKey]; params[@"txPower"] = txPower ?: [NSNull null];
+    [self sendEventWithName:@"onDeviceFound" body:params];
 }
 
-RCT_EXPORT_METHOD(enableAdapter){
-    [self logAndSend:@"enableAdapter function called (No-op on iOS)"];
-}
+// --- Keep other existing methods (enableAdapter, disableAdapter, getAdapterState, isActive) ---
+// Note: getAdapterState and isActive should preferably use peripheralManager state if advertising is the main concern,
+// or centralManager state if general BT readiness is the goal. Let's keep them using centralManager for now.
 
-RCT_EXPORT_METHOD(disableAdapter){
-    [self logAndSend:@"disableAdapter function called (No-op on iOS)"];
-}
+RCT_EXPORT_METHOD(enableAdapter){ [self logAndSend:@"enableAdapter function called (No-op on iOS)"]; }
+RCT_EXPORT_METHOD(disableAdapter){ [self logAndSend:@"disableAdapter function called (No-op on iOS)"]; }
 
-RCT_EXPORT_METHOD(getAdapterState:(RCTPromiseResolveBlock)resolve
-    rejecter:(RCTPromiseRejectBlock)reject){
+RCT_EXPORT_METHOD(getAdapterState:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject){
+    // Uses Central Manager state - reflects general BT availability
     [self logAndSend:@"getAdapterState function called"];
-
-    if (!centralManager) {
-        [self logAndSend:@"Central manager not initialized, cannot get state."];
-        reject(@"CentralManagerError", @"Central manager not initialized", nil);
-        return;
-    }
-
+    if (!centralManager) { [self logAndSend:@"Central manager nil in getAdapterState"]; reject(@"CentralManagerError", @"Central manager not initialized", nil); return; }
     NSString *stateStr;
     switch (centralManager.state) {
-        case CBManagerStatePoweredOn:       stateStr = @"STATE_ON"; break;
+        case CBManagerStatePoweredOn: stateStr = @"STATE_ON"; break;
+        // ... (rest of cases as before) ...
         case CBManagerStatePoweredOff:      stateStr = @"STATE_OFF"; break;
         case CBManagerStateResetting:       stateStr = @"STATE_TURNING_ON"; break;
         case CBManagerStateUnauthorized:    stateStr = @"STATE_OFF"; break;
@@ -287,178 +389,15 @@ RCT_EXPORT_METHOD(getAdapterState:(RCTPromiseResolveBlock)resolve
         case CBManagerStateUnsupported:     stateStr = @"STATE_OFF"; break;
         default:                            stateStr = @"STATE_OFF"; break;
     }
-    [self logAndSend:@"Adapter state determined as: %@", stateStr];
     resolve(stateStr);
 }
 
-RCT_EXPORT_METHOD(isActive:
-     (RCTPromiseResolveBlock)resolve
-    rejecter:(RCTPromiseRejectBlock)reject){
+RCT_EXPORT_METHOD(isActive:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject){
+     // Uses Central Manager state
     [self logAndSend:@"isActive function called"];
-
-    if (!centralManager) {
-        [self logAndSend:@"Central manager not initialized, cannot determine active state."];
-        reject(@"CentralManagerError", @"Central manager not initialized", nil);
-        return;
-    }
-
+    if (!centralManager) { [self logAndSend:@"Central manager nil in isActive"]; reject(@"CentralManagerError", @"Central manager not initialized", nil); return; }
     BOOL isActive = ([centralManager state] == CBManagerStatePoweredOn);
-    [self logAndSend:@"Adapter active status: %@", isActive ? @"YES" : @"NO"];
     resolve(@(isActive));
-}
-
-
-#pragma mark - CBCentralManagerDelegate Methods
-
--(void)centralManager:(CBCentralManager *)central didDiscoverPeripheral:(CBPeripheral *)peripheral advertisementData:(NSDictionary<NSString *,id> *)advertisementData RSSI:(NSNumber *)RSSI {
-    // Optional: Log raw discovery data for debugging
-    // [self logAndSend:@"Discovered Peripheral: Name: %@, ID: %@, RSSI: %@", [peripheral name], [[peripheral identifier] UUIDString], RSSI];
-    // [self logAndSend:@"Advertisement Data: %@", advertisementData];
-
-    NSMutableDictionary *params =  [[NSMutableDictionary alloc] init];
-    NSMutableArray *serviceUUIDs = [[NSMutableArray alloc] init];
-
-    // Extract Service UUIDs
-    NSArray *uuidArray = advertisementData[CBAdvertisementDataServiceUUIDsKey];
-    if ([uuidArray isKindOfClass:[NSArray class]]) {
-        for (CBUUID *uuid in uuidArray) {
-            [serviceUUIDs addObject:[uuid UUIDString]];
-        }
-    }
-
-    // Extract Manufacturer Data
-    NSData *manufData = advertisementData[CBAdvertisementDataManufacturerDataKey];
-    if ([manufData isKindOfClass:[NSData class]] && manufData.length >= 2) {
-        uint16_t discoveredCompanyId = 0;
-        [manufData getBytes:&discoveredCompanyId length:2];
-        discoveredCompanyId = OSSwapLittleToHostInt16(discoveredCompanyId);
-
-        params[@"companyId"] = @(discoveredCompanyId);
-
-        if (manufData.length > 2) {
-             NSData *payloadBytes = [manufData subdataWithRange:NSMakeRange(2, manufData.length - 2)];
-             NSMutableArray *payloadArray = [[NSMutableArray alloc] init];
-             const uint8_t *bytes = [payloadBytes bytes];
-             for (NSUInteger i = 0; i < [payloadBytes length]; i++) {
-                 [payloadArray addObject:@(bytes[i])];
-             }
-             params[@"manufData"] = payloadArray;
-        } else {
-             params[@"manufData"] = @[];
-        }
-    } else {
-         params[@"manufData"] = @[];
-    }
-
-    NSNumber *validRSSI = (RSSI && RSSI.intValue != 127) ? RSSI : nil;
-
-    params[@"serviceUuids"] = serviceUUIDs;
-    params[@"rssi"] = validRSSI ?: [NSNull null];
-    params[@"deviceName"] = [peripheral name] ?: [NSNull null];
-    params[@"deviceAddress"] = [[peripheral identifier] UUIDString];
-
-    NSNumber *txPower = advertisementData[CBAdvertisementDataTxPowerLevelKey];
-    params[@"txPower"] = txPower ?: [NSNull null];
-
-
-    [self sendEventWithName:@"onDeviceFound" body:params];
-}
-
--(void)centralManager:(CBCentralManager *)central didConnectPeripheral:(CBPeripheral *)peripheral {
-     [self logAndSend:@"Peripheral connected: %@", [[peripheral identifier] UUIDString]];
-}
-
--(void)centralManager:(CBCentralManager *)central didFailToConnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
-     [self logAndSend:@"Failed to connect to peripheral: %@, Error: %@", [[peripheral identifier] UUIDString], error.localizedDescription];
-}
-
--(void)centralManager:(CBCentralManager *)central didDisconnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
-    [self logAndSend:@"Peripheral disconnected: %@, Error: %@", [[peripheral identifier] UUIDString], error ? error.localizedDescription : @"(No error)"];
-}
-
-- (void)centralManagerDidUpdateState:(CBCentralManager *)central {
-    [self logAndSend:@"Central manager state updated: %ld", (long)central.state];
-    BOOL enabled = NO;
-    switch (central.state) {
-        case CBManagerStatePoweredOn:
-            enabled = YES;
-            [self logAndSend:@"Central Manager State: Powered ON"];
-            break;
-        case CBManagerStatePoweredOff:
-             [self logAndSend:@"Central Manager State: Powered OFF"];
-             if (central.isScanning) {
-                 [central stopScan];
-                 [self logAndSend:@"Stopped scan due to Bluetooth power off."];
-             }
-            break;
-        case CBManagerStateResetting:
-            [self logAndSend:@"Central Manager State: Resetting"];
-            break;
-        case CBManagerStateUnauthorized:
-            [self logAndSend:@"Central Manager State: Unauthorized"];
-            break;
-        case CBManagerStateUnknown:
-             [self logAndSend:@"Central Manager State: Unknown"];
-            break;
-        case CBManagerStateUnsupported:
-             [self logAndSend:@"Central Manager State: Unsupported"];
-            break;
-        default:
-            break;
-    }
-    [self sendEventWithName:@"onBTStatusChange" body:@{@"enabled": @(enabled)}];
-}
-
-
-#pragma mark - CBPeripheralManagerDelegate Methods
-
-- (void)peripheralManagerDidUpdateState:(CBPeripheralManager *)peripheral
-{
-    [self logAndSend:@"Peripheral manager state updated: %ld", (long)peripheral.state];
-    switch (peripheral.state) {
-        case CBManagerStatePoweredOn:
-            [self logAndSend:@"Peripheral Manager State: Powered ON"];
-            // If there's a pending broadcast, start it now
-            if (pendingUid && pendingResolve) {
-                 [self logAndSend:@"Peripheral manager powered on, attempting to start pending broadcast."];
-                 [self startAdvertising]; // Call the correctly defined method
-            }
-            break;
-
-        case CBManagerStatePoweredOff:
-        case CBManagerStateResetting:
-        case CBManagerStateUnauthorized:
-        case CBManagerStateUnsupported:
-        case CBManagerStateUnknown:
-             [self logAndSend:@"Peripheral Manager State: Not Powered On (%ld)", (long)peripheral.state];
-             if (pendingReject) {
-                 NSString *reason;
-                  switch (peripheral.state) {
-                     case CBManagerStatePoweredOff: reason = @"Bluetooth is powered off"; break;
-                     case CBManagerStateResetting: reason = @"Bluetooth is resetting"; break;
-                     case CBManagerStateUnauthorized: reason = @"Bluetooth permission denied"; break;
-                     case CBManagerStateUnsupported: reason = @"Bluetooth LE not supported"; break;
-                     default: reason = @"Bluetooth state unknown or unavailable"; break;
-                 }
-                 [self logAndSend:@"Rejecting pending broadcast due to peripheral state change: %@", reason];
-                 pendingReject(@"BluetoothUnavailable", reason, nil);
-                 pendingUid = nil; pendingPayload = nil; pendingOptions = nil; pendingResolve = nil; pendingReject = nil;
-             }
-            break;
-
-        default:
-            break;
-    }
-}
-
-- (void)peripheralManagerDidStartAdvertising:(CBPeripheralManager *)peripheral error:(NSError *)error {
-    if (error) {
-        [self logAndSend:@"Failed to start advertising: %@", error.localizedDescription];
-        // The promise is handled by dispatch_after in startAdvertising, just log here.
-    } else {
-        [self logAndSend:@"Successfully started advertising (confirmed by delegate callback)."];
-        // The promise is handled by dispatch_after in startAdvertising.
-    }
 }
 
 
