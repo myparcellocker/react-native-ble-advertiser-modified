@@ -20,23 +20,23 @@
 
 RCT_EXPORT_MODULE(BLEAdvertiser)
 
-// Updated supportedEvents to include "onLogMessage"
+// Updated to include "onNativeLog" in supported events
 - (NSArray<NSString *> *)supportedEvents {
-    return @[@"onDeviceFound", @"onBTStatusChange", @"onLogMessage"];
+    return @[@"onDeviceFound", @"onBTStatusChange", @"onNativeLog"];
 }
 
-// New logInfo method to handle logs and send events
-- (void)logInfo:(NSString *)format, ... {
+// Helper method to log and send events
+- (void)logAndSend:(NSString *)format, ... {
     va_list args;
     va_start(args, format);
     NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-    RCTLogInfo(@"%@", message); // Still log to native console
-    [self sendEventWithName:@"onLogMessage" body:@{@"message": message}]; // Send to JS
+    RCTLogInfo(@"%@", message);
+    [self sendEventWithName:@"onNativeLog" body:@{@"message": message}];
 }
 
 RCT_EXPORT_METHOD(setCompanyId: (nonnull NSNumber *)companyIdNum){
-    [self logInfo:@"setCompanyId function called %@", companyIdNum];
+    [self logAndSend:@"setCompanyId function called %@", companyIdNum];
     companyId = [companyIdNum intValue]; // Store the company ID (e.g., 0xFFFF)
     self->centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:nil options:@{CBCentralManagerOptionShowPowerAlertKey: @(YES)}];
     self->peripheralManager = [[CBPeripheralManager alloc] initWithDelegate:self queue:nil options:nil];
@@ -45,7 +45,7 @@ RCT_EXPORT_METHOD(setCompanyId: (nonnull NSNumber *)companyIdNum){
 RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray options:(NSDictionary *)options
     resolve: (RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logInfo:@"Broadcast function called %@ with payload %@", uid, payloadArray];
+    [self logAndSend:@"Broadcast function called %@ with payload %@", uid, payloadArray];
 
     if (!peripheralManager) {
         reject(@"PeripheralManagerError", @"Peripheral manager not initialized", nil);
@@ -63,13 +63,13 @@ RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray opt
     if (peripheralManager.state == CBManagerStatePoweredOn) {
         [self startAdvertising];
     } else {
-        [self logInfo:@"Waiting for peripheral manager to be powered on..."];
+        [self logAndSend:@"Waiting for peripheral manager to be powered on..."];
     }
 }
 
 - (void)startAdvertising {
     if (!pendingUid || !pendingPayload || !pendingResolve || !pendingReject) {
-        [self logInfo:@"No pending broadcast to start"];
+        [self logAndSend:@"No pending broadcast to start"];
         return;
     }
 
@@ -104,7 +104,7 @@ RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray opt
 
 RCT_EXPORT_METHOD(stopBroadcast:(RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logInfo:@"stopBroadcast function called"];
+    [self logAndSend:@"stopBroadcast function called"];
     if (peripheralManager) {
         [peripheralManager stopAdvertising];
         resolve(@"Stopping Broadcast");
@@ -116,7 +116,7 @@ RCT_EXPORT_METHOD(stopBroadcast:(RCTPromiseResolveBlock)resolve
 RCT_EXPORT_METHOD(scan: (NSArray *)payload options:(NSDictionary *)options 
     resolve: (RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logInfo:@"scan function called"];
+    [self logAndSend:@"scan function called"];
 
     if (!centralManager) { 
         reject(@"Device does not support Bluetooth", @"Adapter is Null", nil); 
@@ -139,7 +139,7 @@ RCT_EXPORT_METHOD(scan: (NSArray *)payload options:(NSDictionary *)options
 RCT_EXPORT_METHOD(scanByService: (NSString *)uid options:(NSDictionary *)options 
     resolve: (RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logInfo:@"scanByService function called with UID %@", uid];
+    [self logAndSend:@"scanByService function called with UID %@", uid];
 
     if (!centralManager) { 
         reject(@"Device does not support Bluetooth", @"Adapter is Null", nil); 
@@ -161,7 +161,7 @@ RCT_EXPORT_METHOD(scanByService: (NSString *)uid options:(NSDictionary *)options
 
 RCT_EXPORT_METHOD(stopScan:(RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logInfo:@"stopScan function called"];
+    [self logAndSend:@"stopScan function called"];
     if (centralManager) {
         [centralManager stopScan];
         resolve(@"Stopping Scan");
@@ -171,18 +171,18 @@ RCT_EXPORT_METHOD(stopScan:(RCTPromiseResolveBlock)resolve
 }
 
 RCT_EXPORT_METHOD(enableAdapter){
-    [self logInfo:@"enableAdapter function called"];
+    [self logAndSend:@"enableAdapter function called"];
     // iOS does not allow programmatic enabling of Bluetooth; user must do it manually
 }
 
 RCT_EXPORT_METHOD(disableAdapter){
-    [self logInfo:@"disableAdapter function called"];
+    [self logAndSend:@"disableAdapter function called"];
     // iOS does not allow programmatic disabling of Bluetooth; user must do it manually
 }
 
 RCT_EXPORT_METHOD(getAdapterState:(RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logInfo:@"getAdapterState function called"];
+    [self logAndSend:@"getAdapterState function called"];
     
     if (!centralManager) {
         reject(@"CentralManagerError", @"Central manager not initialized", nil);
@@ -202,7 +202,7 @@ RCT_EXPORT_METHOD(getAdapterState:(RCTPromiseResolveBlock)resolve
 RCT_EXPORT_METHOD(isActive: 
      (RCTPromiseResolveBlock)resolve
     rejecter:(RCTPromiseRejectBlock)reject){
-    [self logInfo:@"isActive function called"];
+    [self logAndSend:@"isActive function called"];
   
     if (!centralManager) {
         reject(@"CentralManagerError", @"Central manager not initialized", nil);
@@ -213,10 +213,10 @@ RCT_EXPORT_METHOD(isActive:
 }
 
 -(void)centralManager:(CBCentralManager *)central didDiscoverPeripheral:(CBPeripheral *)peripheral advertisementData:(NSDictionary<NSString *,id> *)advertisementData RSSI:(NSNumber *)RSSI {
-    [self logInfo:@"Found Name: %@", [peripheral name]];
-    [self logInfo:@"Found Services: %@", [peripheral services]];
-    [self logInfo:@"Found Id : %@", [peripheral identifier]];
-    [self logInfo:@"Found UUID String : %@", [[peripheral identifier] UUIDString]];
+    [self logAndSend:@"Found Name: %@", [peripheral name]];
+    [self logAndSend:@"Found Services: %@", [peripheral services]];
+    [self logAndSend:@"Found Id : %@", [peripheral identifier]];
+    [self logAndSend:@"Found UUID String : %@", [[peripheral identifier] UUIDString]];
 
     NSArray *keys = [advertisementData allKeys];
     for (int i = 0; i < [keys count]; ++i) {
@@ -261,11 +261,11 @@ RCT_EXPORT_METHOD(isActive:
 }
 
 -(void)centralManager:(CBCentralManager *)central didDisconnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
-    [self logInfo:@"Peripheral disconnected: %@", [peripheral identifier]];
+    [self logAndSend:@"Peripheral disconnected: %@", [peripheral identifier]];
 }
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
-    [self logInfo:@"Central manager state updated: %ld", (long)central.state];
+    [self logAndSend:@"Central manager state updated: %ld", (long)central.state];
     NSMutableDictionary *params =  [[NSMutableDictionary alloc] initWithCapacity:1];      
     switch (central.state) {
         case CBManagerStatePoweredOff:
@@ -301,7 +301,7 @@ RCT_EXPORT_METHOD(isActive:
 #pragma mark - CBPeripheralManagerDelegate
 - (void)peripheralManagerDidUpdateState:(CBPeripheralManager *)peripheral
 {
-    [self logInfo:@"Peripheral manager state updated: %ld", (long)peripheral.state];
+    [self logAndSend:@"Peripheral manager state updated: %ld", (long)peripheral.state];
     switch (peripheral.state) {
         case CBManagerStatePoweredOn:
             NSLog(@"CBPeripheralManagerStatePoweredOn");
