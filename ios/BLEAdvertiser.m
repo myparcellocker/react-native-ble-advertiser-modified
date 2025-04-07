@@ -5,6 +5,12 @@
     CBCentralManager *centralManager;
     CBPeripheralManager *peripheralManager;
     int companyId; // Instance variable to store companyId
+    // Store broadcast parameters
+    NSString *pendingUid;
+    NSArray *pendingPayload;
+    NSDictionary *pendingOptions;
+    RCTPromiseResolveBlock pendingResolve;
+    RCTPromiseRejectBlock pendingReject;
 }
 
 - (dispatch_queue_t)methodQueue
@@ -35,14 +41,30 @@ RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray opt
         return;
     }
 
-    if (peripheralManager.state != CBManagerStatePoweredOn) {
-        reject(@"BluetoothNotPoweredOn", @"Bluetooth is not powered on", nil);
+    // Store parameters
+    pendingUid = [uid copy];
+    pendingPayload = [payloadArray copy];
+    pendingOptions = [options copy];
+    pendingResolve = [resolve copy];
+    pendingReject = [reject copy];
+
+    // Check state and start immediately if ready
+    if (peripheralManager.state == CBManagerStatePoweredOn) {
+        [self startAdvertising];
+    } else {
+        RCTLogInfo(@"Waiting for peripheral manager to be powered on...");
+    }
+}
+
+- (void)startAdvertising {
+    if (!pendingUid || !pendingPayload || !pendingResolve || !pendingReject) {
+        RCTLogInfo(@"No pending broadcast to start");
         return;
     }
 
     // Convert payload array to NSData
     NSMutableData *payloadData = [NSMutableData data];
-    for (NSNumber *byteNum in payloadArray) {
+    for (NSNumber *byteNum in pendingPayload) {
         uint8_t byte = [byteNum unsignedCharValue];
         [payloadData appendBytes:&byte length:1];
     }
@@ -54,12 +76,19 @@ RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray opt
 
     // Advertising data with both UUID and manufacturer data
     NSDictionary *advertisingData = @{
-        CBAdvertisementDataServiceUUIDsKey : @[[CBUUID UUIDWithString:uid]],
+        CBAdvertisementDataServiceUUIDsKey : @[[CBUUID UUIDWithString:pendingUid]],
         CBAdvertisementDataManufacturerDataKey : manufacturerData
     };
 
     [peripheralManager startAdvertising:advertisingData];
-    resolve(@"Broadcasting");
+    pendingResolve(@"Broadcasting");
+
+    // Clear pending parameters after success
+    pendingUid = nil;
+    pendingPayload = nil;
+    pendingOptions = nil;
+    pendingResolve = nil;
+    pendingReject = nil;
 }
 
 RCT_EXPORT_METHOD(stopBroadcast:(RCTPromiseResolveBlock)resolve
@@ -265,18 +294,43 @@ RCT_EXPORT_METHOD(isActive:
     switch (peripheral.state) {
         case CBManagerStatePoweredOn:
             NSLog(@"CBPeripheralManagerStatePoweredOn");
+            [self startAdvertising]; // Start if pending
             break;
         case CBManagerStatePoweredOff:
             NSLog(@"CBPeripheralManagerStatePoweredOff");
+            if (pendingReject) {
+                pendingReject(@"BluetoothNotPoweredOn", @"Bluetooth is not powered on", nil);
+                pendingUid = nil;
+                pendingPayload = nil;
+                pendingOptions = nil;
+                pendingResolve = nil;
+                pendingReject = nil;
+            }
             break;
         case CBManagerStateResetting:
             NSLog(@"CBPeripheralManagerStateResetting");
             break;
         case CBManagerStateUnauthorized:
             NSLog(@"CBPeripheralManagerStateUnauthorized");
+            if (pendingReject) {
+                pendingReject(@"BluetoothUnauthorized", @"Bluetooth permission denied", nil);
+                pendingUid = nil;
+                pendingPayload = nil;
+                pendingOptions = nil;
+                pendingResolve = nil;
+                pendingReject = nil;
+            }
             break;
         case CBManagerStateUnsupported:
             NSLog(@"CBPeripheralManagerStateUnsupported");
+            if (pendingReject) {
+                pendingReject(@"BluetoothUnsupported", @"Bluetooth LE not supported", nil);
+                pendingUid = nil;
+                pendingPayload = nil;
+                pendingOptions = nil;
+                pendingResolve = nil;
+                pendingReject = nil;
+            }
             break;
         case CBManagerStateUnknown:
             NSLog(@"CBPeripheralManagerStateUnknown");
