@@ -85,14 +85,28 @@ RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray opt
     NSMutableData *manufacturerData = [NSMutableData dataWithBytes:&companyIdLE length:2];
     [manufacturerData appendData:payloadData];
 
-    // Advertising data with both UUID and manufacturer data
+    // Advertise ONLY Manufacturer Data to force it into the main packet
     NSDictionary *advertisingData = @{
-        CBAdvertisementDataServiceUUIDsKey : @[[CBUUID UUIDWithString:pendingUid]],
         CBAdvertisementDataManufacturerDataKey : manufacturerData
+        // CBAdvertisementDataServiceUUIDsKey : @[[CBUUID UUIDWithString:pendingUid]] // <-- Temporarily comment this out
     };
 
+   [self logAndSend:@"Starting advertising with Manufacturer Data ONLY: %@", manufacturerData];
     [peripheralManager startAdvertising:advertisingData];
-    pendingResolve(@"Broadcasting");
+
+    // Check if advertising actually started after a short delay (optional sanity check)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self->peripheralManager.isAdvertising) {
+            [self logAndSend:@"Peripheral manager IS advertising."];
+            if (pendingResolve) {
+                 pendingResolve(@"Broadcasting (Manufacturer Data Only)");
+            }
+        } else {
+            [self logAndSend:@"Peripheral manager IS NOT advertising."];
+             if (pendingReject) {
+                 pendingReject(@"AdvertisingStartFailed", @"Peripheral manager did not start advertising after command.", nil);
+             }
+        }
 
     // Clear pending parameters after success
     pendingUid = nil;
