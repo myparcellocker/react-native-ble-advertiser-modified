@@ -41,7 +41,7 @@ RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray opt
     }
 
     // Convert payload array to NSData
-    NSMutableasc NSMutableData *payloadData = [NSMutableData data];
+    NSMutableData *payloadData = [NSMutableData data];
     for (NSNumber *byteNum in payloadArray) {
         uint8_t byte = [byteNum unsignedCharValue];
         [payloadData appendBytes:&byte length:1];

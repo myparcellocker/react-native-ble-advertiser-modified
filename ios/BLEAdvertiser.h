@@ -3,10 +3,6 @@
 #import <React/RCTLog.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 
-@interface BLEAdvertiser : RCTEventEmitter <RCTBridgeModule, CBCentralManagerDelegate, CBPeripheralManagerDelegate, CBPeripheralDelegate> {
-    CBCentralManager *centralManager;
-    CBPeripheralManager *peripheralManager;
-}
+@interface BLEAdvertiser : RCTEventEmitter <RCTBridgeModule, CBCentralManagerDelegate, CBPeripheralManagerDelegate, CBPeripheralDelegate>
 
 @end
-  
