@@ -67,9 +67,14 @@ RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray opt
     }
 }
 
-- (void)startAdvertising {
+(void)startAdvertising {
     if (!pendingUid || !pendingPayload || !pendingResolve || !pendingReject) {
         [self logAndSend:@"No pending broadcast to start"];
+        // Ensure we don't leave promises hanging if we bail early
+        if (pendingReject) {
+            pendingReject(@"InvalidState", @"No pending broadcast parameters.", nil);
+            pendingUid = nil; pendingPayload = nil; pendingOptions = nil; pendingResolve = nil; pendingReject = nil; // Clear state
+        }
         return;
     }
 
@@ -88,32 +93,42 @@ RCT_EXPORT_METHOD(broadcast: (NSString *)uid payload:(NSArray *)payloadArray opt
     // Advertise ONLY Manufacturer Data to force it into the main packet
     NSDictionary *advertisingData = @{
         CBAdvertisementDataManufacturerDataKey : manufacturerData
-        // CBAdvertisementDataServiceUUIDsKey : @[[CBUUID UUIDWithString:pendingUid]] // <-- Temporarily comment this out
+        // CBAdvertisementDataServiceUUIDsKey : @[[CBUUID UUIDWithString:pendingUid]] // <-- Keep this commented for now
     };
 
-   [self logAndSend:@"Starting advertising with Manufacturer Data ONLY: %@", manufacturerData];
+    [self logAndSend:@"Attempting to start advertising with Manufacturer Data ONLY: %@", manufacturerData];
     [peripheralManager startAdvertising:advertisingData];
 
-    // Check if advertising actually started after a short delay (optional sanity check)
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (self->peripheralManager.isAdvertising) {
-            [self logAndSend:@"Peripheral manager IS advertising."];
-            if (pendingResolve) {
-                 pendingResolve(@"Broadcasting (Manufacturer Data Only)");
-            }
-        } else {
-            [self logAndSend:@"Peripheral manager IS NOT advertising."];
-             if (pendingReject) {
-                 pendingReject(@"AdvertisingStartFailed", @"Peripheral manager did not start advertising after command.", nil);
-             }
-        }
+    // Store copies of the resolve/reject blocks to use inside the dispatch_after block
+    // Capture self strongly initially, then manage weak/strong inside block if needed (here it's simple enough)
+    RCTPromiseResolveBlock resolveBlock = [pendingResolve copy];
+    RCTPromiseRejectBlock rejectBlock = [pendingReject copy];
 
-    // Clear pending parameters after success
+    // Clear the original pending promises immediately to prevent accidental reuse
     pendingUid = nil;
     pendingPayload = nil;
     pendingOptions = nil;
     pendingResolve = nil;
     pendingReject = nil;
+
+
+    // Check if advertising actually started after a short delay
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Use the captured resolve/reject blocks
+        if (self->peripheralManager.isAdvertising) {
+            [self logAndSend:@"Peripheral manager IS advertising."];
+            if (resolveBlock) {
+                 resolveBlock(@"Broadcasting (Manufacturer Data Only)");
+            }
+        } else {
+            [self logAndSend:@"Peripheral manager IS NOT advertising."];
+             if (rejectBlock) {
+                 rejectBlock(@"AdvertisingStartFailed", @"Peripheral manager did not start advertising after command.", nil);
+             }
+        }
+        // Note: Don't clear pending params here, they were cleared outside the block
+    });
+
 }
 
 RCT_EXPORT_METHOD(stopBroadcast:(RCTPromiseResolveBlock)resolve
