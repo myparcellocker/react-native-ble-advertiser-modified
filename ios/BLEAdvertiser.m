@@ -97,13 +97,15 @@ RCT_EXPORT_METHOD(broadcast:(NSString *)uid payload:(NSArray *)payloadArray opti
     // Add the service to peripheral manager
     [peripheralManager addService:customService];
 
-    // Convert payload bytes to UTF-8 string
-    NSMutableData *payloadData = [NSMutableData data];
-    for (NSNumber *byteNum in pendingPayload) {
-        uint8_t byte = [byteNum unsignedCharValue];
-        [payloadData appendBytes:&byte length:1];
-    }
+    // Convert payload bytes to UTF-8 string for device name
     NSString *deviceName = [[NSString alloc] initWithData:payloadData encoding:NSUTF8StringEncoding];
+    if (!deviceName) {
+        [self logAndSend:@"Failed to create device name from payload data"];
+        pendingReject(@"EncodingError", @"Failed to create device name from payload", nil);
+        [self clearPending];
+        return;
+    }
+
     // Start advertising with service UUID and device name
     [peripheralManager startAdvertising:@{
         CBAdvertisementDataServiceUUIDsKey: @[serviceUUID],
